@@ -1,0 +1,16 @@
+# PDF 下载目录
+papers/
+
+# Excel 数据文件
+*.xlsx
+
+# Python
+__pycache__/
+*.pyc
+
+# 环境变量
+.env
+
+# IDE
+.vscode/
+.idea/
