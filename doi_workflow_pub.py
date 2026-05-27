@@ -17,6 +17,9 @@ import re
 import sys
 import time
 import socket
+import threading
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -44,6 +47,30 @@ DOI_COLUMN = "DOI"                         # Excel 中 DOI 列的列名
 
 REQUEST_INTERVAL = 3                       # 请求间隔（秒），避免被限流
 SCI_HUB_TIMEOUT = 30                       # Sci-Hub 单次请求超时（秒）
+DOWNLOAD_TIMEOUT = 30                      # 通用 PDF 下载超时（秒）
+
+# ============================================================
+# 多源下载配置（按 DOWNLOAD_SOURCES 顺序依次尝试，成功即停）
+# ============================================================
+
+DOWNLOAD_SOURCES = ["unpaywall", "pmc", "semantic_scholar", "scihub"]
+
+# Unpaywall（必填邮箱，否则自动跳过此源）
+UNPAYWALL_EMAIL = "your_email@example.com"
+
+# NCBI/PMC（可选，不填也能用但速率限制更低）
+NCBI_API_KEY = ""
+
+# Semantic Scholar（可选，不填也能用但速率限制更低）
+S2_API_KEY = ""
+
+# 来源显示名映射
+SOURCE_DISPLAY = {
+    "unpaywall": "Unpaywall",
+    "pmc": "PMC",
+    "semantic_scholar": "Semantic Scholar",
+    "scihub": "Sci-Hub",
+}
 
 # ============================================================
 # Sci-Hub 域名列表（按优先级排列，失效时可自行增减）
@@ -118,11 +145,26 @@ def resolve_doi(doi: str, session: requests.Session) -> dict | None:
     }
 
 
-def add_to_zotero(zot: zotero.Zotero, meta: dict) -> str | None:
-    """在 Zotero 中创建期刊文章条目，返回 item key。"""
+def add_to_zotero(zot: zotero.Zotero, meta: dict) -> tuple[str | None, str]:
+    """在 Zotero 中创建或查找期刊文章条目，返回 (item_key, action)。
+
+    action 为: '创建' | '已存在' | '失败'
+    """
+    doi = meta["doi"]
+
+    # 先查是否已存在同 DOI 条目
+    try:
+        existing = zot.items(q=doi, limit=1)
+        if existing:
+            key = existing[0]["key"]
+            print(f"        Zotero 条目已存在 (key: {key})，跳过创建")
+            return key, "已存在"
+    except Exception:
+        pass  # 查询失败则继续创建
+
     template = zot.item_template("journalArticle")
     template["title"] = meta["title"]
-    template["DOI"] = meta["doi"]
+    template["DOI"] = doi
     template["url"] = meta["url"]
     template["publicationTitle"] = meta["journal"]
     template["volume"] = meta["volume"]
@@ -145,17 +187,16 @@ def add_to_zotero(zot: zotero.Zotero, meta: dict) -> str | None:
     try:
         resp = zot.create_items([template])
         result = resp.get("success", {})
-        # pyzotero 返回格式: {"success": {"0": "item_key"}} 或 {"0": "item_key"}
         if "0" in result:
-            return result["0"]
+            return result["0"], "创建"
         if isinstance(result, dict):
             for v in result.values():
                 if isinstance(v, str) and len(v) == 8:
-                    return v
-        return None
+                    return v, "创建"
+        return None, "失败"
     except Exception as e:
         print(f"  [!] Zotero 导入失败: {e}")
-        return None
+        return None, "失败"
 
 
 def attach_pdf_to_zotero(zot: zotero.Zotero, parent_key: str, pdf_path: str) -> bool:
@@ -272,6 +313,327 @@ def _extract_pdf_url(html: str, base_url: str) -> str | None:
     return None
 
 
+# ============================================================
+# 多源下载：Unpaywall / PMC / Semantic Scholar
+# ============================================================
+
+
+def download_from_unpaywall(
+    doi: str, output_dir: Path, filename: str, session: requests.Session
+) -> tuple[str | None, str, str | None]:
+    """通过 Unpaywall API 查找 OA PDF 并下载。
+
+    返回: (pdf_path | None, status_message, landing_url | None)
+    """
+    if "your_" in UNPAYWALL_EMAIL or not UNPAYWALL_EMAIL:
+        return None, "Unpaywall 未配置邮箱，跳过", None
+
+    try:
+        resp = session.get(
+            f"https://api.unpaywall.org/v2/{doi}",
+            params={"email": UNPAYWALL_EMAIL},
+            timeout=15,
+        )
+        if resp.status_code == 404:
+            return None, "Unpaywall 未收录此 DOI", None
+        if resp.status_code == 403:
+            return None, "Unpaywall 拒绝访问 (403)", None
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.Timeout:
+        return None, "Unpaywall 请求超时", None
+    except Exception as e:
+        return None, f"Unpaywall 请求失败: {e}", None
+
+    if not data.get("is_oa"):
+        return None, "Unpaywall 无 OA 版本", None
+
+    # 优先 best_oa_location，否则遍历 oa_locations 找 pdf
+    pdf_url = None
+    landing_url = None
+    best = data.get("best_oa_location") or {}
+    pdf_url = best.get("url_for_pdf")
+    landing_url = best.get("url")
+
+    if not pdf_url:
+        for loc in data.get("oa_locations", []):
+            pdf_url = loc.get("url_for_pdf")
+            landing_url = landing_url or loc.get("url")
+            if pdf_url:
+                break
+
+    if not pdf_url:
+        msg = "Unpaywall 找到 OA 但无 PDF 直链"
+        if landing_url:
+            msg += f" (OA 页面: {landing_url})"
+        return None, msg, landing_url
+
+    # 下载 PDF
+    try:
+        pdf_resp = session.get(pdf_url, timeout=DOWNLOAD_TIMEOUT)
+        content_type = pdf_resp.headers.get("Content-Type", "")
+        if "application/pdf" not in content_type and not filename.endswith(".pdf"):
+            return None, f"Unpaywall 返回非 PDF (Content-Type: {content_type})", landing_url
+        if len(pdf_resp.content) < 10_000:
+            return None, "Unpaywall 返回文件过小 (<10KB)", landing_url
+        output_path = output_dir / filename
+        with open(output_path, "wb") as f:
+            f.write(pdf_resp.content)
+        return str(output_path), "已下载(unpaywall)", None
+    except requests.Timeout:
+        return None, "Unpaywall PDF 下载超时", landing_url
+    except Exception as e:
+        return None, f"Unpaywall PDF 下载失败: {e}", landing_url
+
+
+def download_from_pmc(
+    doi: str, output_dir: Path, filename: str, session: requests.Session
+) -> tuple[str | None, str]:
+    """通过 NCBI E-utilities 从 PubMed Central 下载 PDF。"""
+    # Step 1: DOI → PMCID
+    idconv_params = {
+        "ids": doi,
+        "format": "json",
+        "tool": "doi-workflow",
+    }
+    if NCBI_API_KEY:
+        idconv_params["api_key"] = NCBI_API_KEY
+
+    try:
+        resp = session.get(
+            "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/",
+            params=idconv_params,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.Timeout:
+        return None, "PMC idconv 请求超时"
+    except Exception as e:
+        return None, f"PMC idconv 请求失败: {e}"
+
+    records = data.get("records", [])
+    if not records:
+        return None, "PMC 未收录此 DOI"
+    pmcid = records[0].get("pmcid")
+    if not pmcid:
+        return None, "PMC idconv 无 PMCID"
+
+    # Step 2: 尝试直接下载 PDF
+    efetch_params = {
+        "db": "pmc",
+        "id": pmcid,
+        "rettype": "pdf",
+        "tool": "doi-workflow",
+    }
+    if NCBI_API_KEY:
+        efetch_params["api_key"] = NCBI_API_KEY
+
+    try:
+        pdf_resp = session.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
+            params=efetch_params,
+            timeout=DOWNLOAD_TIMEOUT,
+        )
+        content_type = pdf_resp.headers.get("Content-Type", "")
+
+        # 成功返回 PDF
+        if "application/pdf" in content_type:
+            if len(pdf_resp.content) < 10_000:
+                return None, "PMC 返回文件过小 (<10KB)"
+            output_path = output_dir / filename
+            with open(output_path, "wb") as f:
+                f.write(pdf_resp.content)
+            return str(output_path), "已下载(pmc)"
+
+        # 返回 XML 时尝试从中提取 PDF 链接
+        if "xml" in content_type or pdf_resp.text.strip().startswith("<?xml"):
+            pdf_url = _extract_pmc_xml_pdf(pdf_resp.text)
+            if pdf_url:
+                pdf2 = session.get(pdf_url, timeout=DOWNLOAD_TIMEOUT)
+                ct2 = pdf2.headers.get("Content-Type", "")
+                if "application/pdf" in ct2 and len(pdf2.content) >= 10_000:
+                    output_path = output_dir / filename
+                    with open(output_path, "wb") as f:
+                        f.write(pdf2.content)
+                    return str(output_path), "已下载(pmc)"
+
+        return None, f"PMC 返回非 PDF (Content-Type: {content_type})"
+    except requests.Timeout:
+        return None, "PMC PDF 下载超时"
+    except Exception as e:
+        return None, f"PMC PDF 下载失败: {e}"
+
+
+def _extract_pmc_xml_pdf(xml_text: str) -> str | None:
+    """从 PMC XML 中提取 PDF 链接。"""
+    try:
+        root = ET.fromstring(xml_text)
+        ns = {"xlink": "http://www.w3.org/1999/xlink"}
+        for uri in root.iter("self-uri"):
+            if uri.get("content-type") == "pdf":
+                href = uri.get("{http://www.w3.org/1999/xlink}href")
+                if href:
+                    return href
+        # 也尝试直接搜索 xlink:href="...pdf"
+        m = re.search(r'xlink:href="(https?://[^"]+\.pdf)"', xml_text)
+        if m:
+            return m.group(1)
+    except ET.ParseError:
+        pass
+    return None
+
+
+def download_from_semantic_scholar(
+    doi: str, output_dir: Path, filename: str, session: requests.Session
+) -> tuple[str | None, str]:
+    """通过 Semantic Scholar API 查找 OA PDF 并下载。"""
+    headers = {}
+    if S2_API_KEY:
+        headers["x-api-key"] = S2_API_KEY
+
+    try:
+        resp = session.get(
+            f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}",
+            params={"fields": "openAccessPdf"},
+            headers=headers,
+            timeout=15,
+        )
+        if resp.status_code == 404:
+            return None, "Semantic Scholar 未收录此 DOI"
+        if resp.status_code == 429:
+            return None, "Semantic Scholar 速率限制 (429)"
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.Timeout:
+        return None, "Semantic Scholar 请求超时"
+    except Exception as e:
+        return None, f"Semantic Scholar 请求失败: {e}"
+
+    oa_pdf = data.get("openAccessPdf")
+    if not oa_pdf or not oa_pdf.get("url"):
+        return None, "Semantic Scholar 无 OA PDF"
+
+    pdf_url = oa_pdf["url"]
+    try:
+        pdf_resp = session.get(pdf_url, timeout=DOWNLOAD_TIMEOUT)
+        content_type = pdf_resp.headers.get("Content-Type", "")
+        if "application/pdf" not in content_type and not filename.endswith(".pdf"):
+            return None, f"Semantic Scholar 返回非 PDF (Content-Type: {content_type})"
+        if len(pdf_resp.content) < 10_000:
+            return None, "Semantic Scholar 返回文件过小 (<10KB)"
+        output_path = output_dir / filename
+        with open(output_path, "wb") as f:
+            f.write(pdf_resp.content)
+        return str(output_path), "已下载(semantic_scholar)"
+    except requests.Timeout:
+        return None, "Semantic Scholar PDF 下载超时"
+    except Exception as e:
+        return None, f"Semantic Scholar PDF 下载失败: {e}"
+
+
+def _try_source(name: str, fn, doi: str, output_dir: Path, filename: str,
+                session: requests.Session, cancel_event: threading.Event,
+                result: dict):
+    """在线程中尝试单个下载源。"""
+    if cancel_event.is_set():
+        return
+
+    # 使用临时文件名避免多线程写入冲突
+    tmp_filename = filename + f".tmp_{name}"
+    try:
+        ret = fn(doi, output_dir, tmp_filename, session)
+    except Exception as e:
+        ret = (None, f"{SOURCE_DISPLAY.get(name, name)} 异常: {e}")
+
+    if len(ret) == 3:
+        path, status, landing_url = ret
+    else:
+        path, status = ret
+        landing_url = None
+
+    if path and not cancel_event.is_set():
+        # 首个成功者：重命名为最终文件名并广播取消
+        final_path = output_dir / filename
+        try:
+            os.replace(path, final_path)
+            path = str(final_path)
+        except OSError:
+            pass  # 重命名失败则保留临时文件名
+        result["path"] = path
+        result["status"] = status
+        result["landing_url"] = None
+        cancel_event.set()
+
+    # 记录日志（按顺序输出，避免 tqdm 错乱）
+    display = SOURCE_DISPLAY.get(name, name)
+    if not cancel_event.is_set() or result.get("path") == path:
+        pass  # 成功者在主线程输出
+
+    result["errors"].append((name, status, landing_url))
+
+
+def download_pdf_multi(
+    doi: str, output_dir: Path, filename: str, session: requests.Session
+) -> tuple[str | None, str]:
+    """并行尝试所有下载源，首个成功即返回。"""
+    sources = {
+        "unpaywall": download_from_unpaywall,
+        "pmc": download_from_pmc,
+        "semantic_scholar": download_from_semantic_scholar,
+        "scihub": download_from_scihub,
+    }
+
+    cancel_event = threading.Event()
+    result = {"path": None, "status": None, "landing_url": None, "errors": []}
+
+    executor = ThreadPoolExecutor(max_workers=len(DOWNLOAD_SOURCES))
+    futures = []
+    for source_name in DOWNLOAD_SOURCES:
+        fn = sources.get(source_name)
+        if not fn:
+            continue
+        futures.append(executor.submit(
+            _try_source, source_name, fn, doi, output_dir, filename,
+            session, cancel_event, result
+        ))
+
+    # 首个成功即停止等待，其余线程后台自行结束
+    for f in as_completed(futures):
+        f.result()
+        if result["path"]:
+            executor.shutdown(wait=False, cancel_futures=True)
+            break
+    else:
+        executor.shutdown(wait=False)
+
+    # 清理未使用的临时文件
+    for name in DOWNLOAD_SOURCES:
+        tmp_file = output_dir / (filename + f".tmp_{name}")
+        if tmp_file.exists():
+            try:
+                tmp_file.unlink()
+            except OSError:
+                pass
+
+    if result["path"]:
+        return result["path"], result["status"]
+
+    # 构建失败摘要，附带 OA 落地页链接
+    errors = []
+    fallback_urls = []
+    for name, status, landing_url in result["errors"]:
+        display = SOURCE_DISPLAY.get(name, name)
+        errors.append(f"[{display}] {status}")
+        if landing_url:
+            fallback_urls.append(landing_url)
+
+    summary = "；".join(errors) if errors else "所有源均未尝试"
+    if fallback_urls:
+        summary += f" | OA 落地页: {', '.join(fallback_urls[:3])}"
+    return None, f"下载失败: {summary}"
+
+
 def normalize_doi(doi: str) -> str:
     """从完整 URL 或裸字符串中提取裸 DOI。"""
     doi = doi.strip()
@@ -364,7 +726,7 @@ def setup_excel(excel_path: str) -> tuple:
 
 def main():
     print("=" * 60)
-    print("  DOI 工作流：Excel → Zotero + Sci-Hub 下载")
+    print("  DOI 工作流：Excel → Zotero + 多源 PDF 下载")
     print("=" * 60)
 
     # 连接 Zotero
@@ -408,7 +770,7 @@ def main():
         print(f"  DOI: {doi}")
 
         # 断点续传：跳过已下载的
-        if prev_status and "已下载" in str(prev_status):
+        if prev_status and str(prev_status).startswith("已下载"):
             print(f"  [跳过] 已下载过")
             skip_count += 1
             continue
@@ -445,30 +807,33 @@ def main():
         item_key = None
         if zot:
             print(f"  [2/3] 导入 Zotero...")
-            item_key = add_to_zotero(zot, meta)
+            item_key, zot_action = add_to_zotero(zot, meta)
             if item_key:
-                print(f"        Zotero 条目已创建 (key: {item_key})")
+                if zot_action == "已存在":
+                    print(f"        Zotero 条目已存在 (key: {item_key})，若下载成功将补充附件")
+                else:
+                    print(f"        Zotero 条目已创建 (key: {item_key})")
             else:
                 print(f"        Zotero 创建失败，继续尝试下载 PDF")
         else:
             print(f"  [2/3] 跳过 Zotero (未配置)")
 
-        # 3. Sci-Hub 下载
-        print(f"  [3/3] Sci-Hub 下载 PDF...")
+        # 3. 多源下载
+        print(f"  [3/3] 多源下载 PDF...")
         if not title:
             safe_title = sanitize_filename(doi.replace("/", "_"))
         else:
             safe_title_part = f"{meta.get('year', '')}_{title}" if meta.get("year") else title
             safe_title = sanitize_filename(safe_title_part)
 
-        pdf_path, status_msg = download_from_scihub(doi, output_dir, safe_title, session)
+        pdf_path, status_msg = download_pdf_multi(doi, output_dir, safe_title, session)
 
         if pdf_path:
             # 尝试挂载到 Zotero
             if item_key and zot:
                 attach_pdf_to_zotero(zot, item_key, pdf_path)
 
-            _write_result(ws, row, header_cols, doi, status="已下载", note="", pdf_path=pdf_path)
+            _write_result(ws, row, header_cols, doi, status=status_msg, note="", pdf_path=pdf_path)
             print(f"        [OK] {status_msg} -> {pdf_path}")
             success_count += 1
         else:
@@ -531,7 +896,7 @@ def _write_result(
     # 状态列着色
     if status_col:
         cell = ws.cell(row=row, column=status_col)
-        if status == "已下载":
+        if status.startswith("已下载"):
             cell.font = Font(color="006100")
             cell.fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
         elif "失败" in status or "无效" in status:

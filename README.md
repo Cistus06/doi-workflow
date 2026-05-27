@@ -7,8 +7,8 @@
 1. 从 Excel 读取 DOI 列表
 2. 通过 CrossRef API 获取文献元数据（标题、作者、期刊、年份等）
 3. 通过 pyzotero 将文献导入 Zotero（可选）
-4. 从 Sci-Hub 下载 PDF 并保存到本地
-5. 下载结果（成功/失败原因）写回 Excel，支持断点续传
+4. 多源 PDF 下载：依次尝试 Unpaywall → PubMed Central → Semantic Scholar → Sci-Hub
+5. 下载结果（成功/失败原因/下载来源）写回 Excel，支持断点续传
 
 ## 前置条件
 
@@ -69,14 +69,36 @@ python doi_workflow.py
 
 每处理完一条立即写入 Excel。如果脚本中断，重新运行会自动跳过已标记"已下载"的行。
 
-## Sci-Hub 下载策略
+## 多源下载策略
 
-依次尝试以下域名，每个域名最多重试 2 次：
-- sci-hub.ru
-- sci-hub.se
-- sci-hub.st
+按以下优先级依次尝试，首个成功即停止：
 
-下载超时 30 秒，请求间隔 3 秒。
+| 优先级 | 来源 | 说明 | 配置要求 |
+|--------|------|------|----------|
+| 1 | **Unpaywall** | 全球最大的 OA 论文索引，覆盖各类 OA（金色、绿色、hybrid）期刊 | 需填写邮箱 |
+| 2 | **PubMed Central** | 美国国立医学图书馆全文仓储，NIH 资助论文必须存缴 | 无需配置（可选填 API Key 提高限速） |
+| 3 | **Semantic Scholar** | AI 学术搜索引擎，部分论文提供 OA PDF 链接 | 无需配置（可选填 API Key 提高限速） |
+| 4 | **Sci-Hub** | 最后兜底，对老论文覆盖较好，新论文较少 | 无需配置 |
+
+各源下载超时 30 秒，请求间隔 3 秒。
+
+> **注意**：Google Scholar 不提供公开 API 且会主动反爬，因此未集成。Unpaywall + PMC 已覆盖绝大部分可免费获取的学术论文。
+
+### 配置多源下载
+
+```python
+# 下载优先级（可调整顺序或移除某个源）
+DOWNLOAD_SOURCES = ["unpaywall", "pmc", "semantic_scholar", "scihub"]
+
+# Unpaywall 邮箱（必填，否则跳过此源）
+UNPAYWALL_EMAIL = "your_email@example.com"
+
+# 可选 API Key（提高速率限制）
+NCBI_API_KEY = ""    # https://www.ncbi.nlm.nih.gov/account/
+S2_API_KEY = ""      # https://www.semanticscholar.org/product/api
+```
+
+Excel 下载状态列会标注成功来源，如 `已下载(unpaywall)`、`已下载(pmc)` 等。
 
 ## 注意事项
 

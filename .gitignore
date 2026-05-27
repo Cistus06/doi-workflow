@@ -1,6 +1,9 @@
 # PDF 下载目录
 papers/
 
+# 本地脚本（含 API Key）
+doi_workflow.py
+
 # Excel 数据文件
 *.xlsx
 
